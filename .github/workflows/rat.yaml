@@ -1,76 +1,227 @@
-trivy:
-    name: Trivy - Dependency Scanning
-    runs-on: ubuntu-latest
-    needs: gitleaks
+name: SecOps Pipeline
 
-    steps:
-      - name: Display Received Application Information
-        run: |
-          echo "SecOps Repo received Application trigger for dependency scan"
-          echo "Application Repository: ${{ github.event.client_payload.repository }}"
-          echo "Application Branch: ${{ github.event.client_payload.branch }}"
-          echo "Application Commit SHA: ${{ github.event.client_payload.commit_sha }}"
+on:
+  repository_dispatch:
+    types:
+      - application_push
 
-      - name: Checkout Exact Application Commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.client_payload.repository }}
-          ref: ${{ github.event.client_payload.commit_sha }}
-          path: application
+jobs:
+  # Stage 1 : Secret Scanning
+  gitleaks:
+    name: Gitleaks - Secret Scanning
+    runs-on: ubuntu-latest
 
-      - name: Verify Checked Out Commit
-        run: |
-          echo "Application Source Successfully checked out"
-          echo "Checked Out Commit SHA:"
-          git -C application rev-parse HEAD
+    steps:
+      - name: Display Received Application Information
+        run: |
+          echo "SecOps Repo received Application trigger"
+          echo "Application Repository: ${{ github.event.client_payload.repository }}"
+          echo "Application Branch: ${{ github.event.client_payload.branch }}"
+          echo "Application Commit SHA: ${{ github.event.client_payload.commit_sha }}"
 
-      # Scan the checked-out application source for vulnerable dependencies
-      - name: Step 1 - Scan Dependencies for Vulnerabilities
-        run: |
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/application:/repo" \
-            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
-            aquasec/trivy:latest \
-            fs \
-            /repo \
-            --scanners vuln \
-            --severity CRITICAL,HIGH \
-            --format table \
-            --exit-code 1
+      - name: Checkout Exact Application Commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.commit_sha }}
+          path: application
 
-      - name: Step 2 - Generate JSON Report of Findings
-        if: always()
-        run: |
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/application:/repo" \
-            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
-            aquasec/trivy:latest \
-            fs \
-            /repo \
-            --scanners vuln \
-            --severity CRITICAL,HIGH \
-            --format json \
-            --output /repo/trivy-report.json \
-            --exit-code 0
+      - name: Verify Checked Out Commit
+        run: |
+          echo "Application Source Successfully checked out"
+          echo "Checked Out Commit SHA:"
+          git -C application rev-parse HEAD
 
-      - name: Step 3 - Show Vulnerability Summary
-        if: always()
-        run: |
-          echo "Trivy Dependency Findings:"
-          echo "====================================="
-          if [ -f "application/trivy-report.json" ]; then
-            cat application/trivy-report.json | jq -r '
-              .Results[]? | select(.Vulnerabilities != null) |
-              .Vulnerabilities[] |
-              "Package: \(.PkgName)\nInstalled: \(.InstalledVersion)\nFixed In: \(.FixedVersion // "N/A")\nSeverity: \(.Severity)\nCVE: \(.VulnerabilityID)\n---"
-            '
-          else
-            echo "No report file found — either no vulnerable dependencies were detected or the scan did not run."
-          fi
+      - name: Step 4 - Scan for Application Secrets
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/application:/repo" \
+            ghcr.io/gitleaks/gitleaks:latest \
+            detect \
+            --source=/repo \
+            --no-git \
+            --no-banner \
+            --report-format json \
+            --report-path /repo/gitleaks-report.json \
+            --exit-code 1
 
-      - name: Upload Trivy Report Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-dependency-report
-          path: application/trivy-report.json
+      - name: Step 4B - Show Detected Secrets
+        if: always()
+        run: |
+          echo "Gitleaks Findings:"
+          echo "====================================="
+          if [ -f "application/gitleaks-report.json" ]; then
+            cat application/gitleaks-report.json | jq -r '
+              .[] | "File: \(.File)\nLine: \(.StartLine)\nRule: \(.RuleID)\nSecret: \(.Match)\nCommit: \(.Commit // "N/A")\n---"
+            '
+          else
+            echo "No report file found — either no secrets were detected or the scan did not run."
+          fi
+
+      - name: Step 4A - List Scanned Files
+        run: |
+          echo "Files Inside Gitleaks Scanning Scope:"
+          echo "====================================="
+          find application -type f -print
+
+  # Stage 2 : Dependency Scanning
+  trivy-deps:
+    name: Trivy - Dependency Scanning
+    runs-on: ubuntu-latest
+    needs: gitleaks
+
+    steps:
+      - name: Display Received Application Information
+        run: |
+          echo "SecOps Repo received Application trigger for dependency scan"
+          echo "Application Repository: ${{ github.event.client_payload.repository }}"
+          echo "Application Branch: ${{ github.event.client_payload.branch }}"
+          echo "Application Commit SHA: ${{ github.event.client_payload.commit_sha }}"
+
+      - name: Checkout Exact Application Commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.commit_sha }}
+          path: application
+
+      - name: Verify Checked Out Commit
+        run: |
+          echo "Application Source Successfully checked out"
+          echo "Checked Out Commit SHA:"
+          git -C application rev-parse HEAD
+
+      - name: Step 1 - Scan Dependencies for Vulnerabilities
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/application:/repo" \
+            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
+            aquasec/trivy:latest \
+            fs \
+            /repo \
+            --scanners vuln \
+            --severity CRITICAL,HIGH \
+            --format table \
+            --exit-code 1
+
+      - name: Step 2 - Generate JSON Report of Findings
+        if: always()
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/application:/repo" \
+            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
+            aquasec/trivy:latest \
+            fs \
+            /repo \
+            --scanners vuln \
+            --severity CRITICAL,HIGH \
+            --format json \
+            --output /repo/trivy-fs-report.json \
+            --exit-code 0
+
+      - name: Step 3 - Show Vulnerability Summary
+        if: always()
+        run: |
+          echo "Trivy Dependency Findings:"
+          echo "====================================="
+          if [ -f "application/trivy-fs-report.json" ]; then
+            cat application/trivy-fs-report.json | jq -r '
+              .Results[]? | select(.Vulnerabilities != null) |
+              .Vulnerabilities[] |
+              "Package: \(.PkgName)\nInstalled: \(.InstalledVersion)\nFixed In: \(.FixedVersion // "N/A")\nSeverity: \(.Severity)\nCVE: \(.VulnerabilityID)\n---"
+            '
+          else
+            echo "No report file found — either no vulnerable dependencies were detected or the scan did not run."
+          fi
+
+      - name: Upload Trivy FS Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-dependency-report
+          path: application/trivy-fs-report.json
+
+  # Stage 3 : Docker Image Build + Image Scanning
+  build-and-scan-image:
+    name: Build & Scan Docker Image
+    runs-on: ubuntu-latest
+    needs: trivy-deps
+
+    steps:
+      - name: Display Received Application Information
+        run: |
+          echo "SecOps Repo received Application trigger for image build & scan"
+          echo "Application Repository: ${{ github.event.client_payload.repository }}"
+          echo "Application Branch: ${{ github.event.client_payload.branch }}"
+          echo "Application Commit SHA: ${{ github.event.client_payload.commit_sha }}"
+
+      - name: Checkout Exact Application Commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repository }}
+          ref: ${{ github.event.client_payload.commit_sha }}
+          path: application
+
+      - name: Verify Checked Out Commit
+        run: |
+          echo "Application Source Successfully checked out"
+          echo "Checked Out Commit SHA:"
+          git -C application rev-parse HEAD
+
+      # Build the Docker image from the application's Dockerfile
+      - name: Step 1 - Build Docker Image
+        run: |
+          docker build \
+            -t hireflow-backend:${{ github.event.client_payload.commit_sha }} \
+            -f application/backend/Dockerfile \
+            application/backend
+
+      # Scan the freshly built image for OS + library vulnerabilities
+      - name: Step 2 - Scan Docker Image for Vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
+            aquasec/trivy:latest \
+            image \
+            hireflow-backend:${{ github.event.client_payload.commit_sha }} \
+            --severity CRITICAL,HIGH \
+            --format table \
+            --exit-code 1
+
+      - name: Step 3 - Generate JSON Report of Image Findings
+        if: always()
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${GITHUB_WORKSPACE}/trivy-cache:/root/.cache/" \
+            -v "${GITHUB_WORKSPACE}:/output" \
+            aquasec/trivy:latest \
+            image \
+            hireflow-backend:${{ github.event.client_payload.commit_sha }} \
+            --severity CRITICAL,HIGH \
+            --format json \
+            --output /output/trivy-image-report.json \
+            --exit-code 0
+
+      - name: Step 4 - Show Image Vulnerability Summary
+        if: always()
+        run: |
+          echo "Trivy Image Scan Findings:"
+          echo "====================================="
+          if [ -f "trivy-image-report.json" ]; then
+            cat trivy-image-report.json | jq -r '
+              .Results[]? | select(.Vulnerabilities != null) |
+              .Vulnerabilities[] |
+              "Package: \(.PkgName)\nInstalled: \(.InstalledVersion)\nFixed In: \(.FixedVersion // "N/A")\nSeverity: \(.Severity)\nCVE: \(.VulnerabilityID)\n---"
+            '
+          else
+            echo "No report file found — either no vulnerabilities were detected or the scan did not run."
+          fi
+
+      - name: Upload Trivy Image Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.json
